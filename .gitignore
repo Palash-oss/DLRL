@@ -84,3 +84,7 @@ models/saved/
 *.onnx
 *.tflite
 
+# Allow storing backend checkpoints via Git LFS (negate the global ignores)
+!backend/checkpoints/
+!backend/checkpoints/*.pt
+
