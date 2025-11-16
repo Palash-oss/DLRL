@@ -1,0 +1,66 @@
+.sentiment-analyzer {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.image-preview {
+  margin-top: var(--space-lg);
+  max-width: 400px;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.image-preview img {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.result-header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xl);
+  margin-bottom: var(--space-2xl);
+}
+
+.confidence-info {
+  width: 100%;
+}
+
+.confidence-label {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin-bottom: var(--space-md);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.explainability-section {
+  margin-top: var(--space-2xl);
+  padding-top: var(--space-2xl);
+  border-top: 1px solid var(--border);
+}
+
+.explainability-item {
+  margin-top: var(--space-xl);
+  padding: var(--space-xl);
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+}
+
+.explainability-item h4 {
+  margin-bottom: var(--space-lg);
+  color: var(--text-primary);
+  font-weight: 500;
+  font-size: var(--text-base);
+}
+
+@media (max-width: 768px) {
+  .image-preview {
+    max-width: 100%;
+  }
+}
+
