@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import axios from 'axios';
+import apiClient from '../apiClient';
 import {
   LineChart,
   Line,
@@ -28,7 +28,7 @@ function Dashboard() {
 
   const fetchDashboardData = async () => {
     try {
-      const response = await axios.get('/api/dashboard');
+      const response = await apiClient.get('/api/dashboard');
       const data = response.data;
       setStats(data);
       
@@ -69,6 +69,13 @@ function Dashboard() {
         { name: 'Neutral', value: stats.sentiment_distribution.neutral, color: '#ffc107' },
         { name: 'Negative', value: stats.sentiment_distribution.negative, color: '#dc3545' }
       ]
+    : [];
+
+  const learningCurveData = stats?.feedback_curve
+    ? stats.feedback_curve.map((entry) => ({
+        episode: entry.episode || 0,
+        total_reward: entry.total_reward || 0,
+      }))
     : [];
 
   return (
@@ -152,6 +159,35 @@ function Dashboard() {
           </div>
         )}
       </div>
+
+      {learningCurveData.length > 0 && (
+        <div className="card">
+          <h2>Learning Curve</h2>
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart data={learningCurveData}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+              <XAxis
+                dataKey="episode"
+                stroke="#ffffff"
+                style={{ fontSize: '13px' }}
+                tickFormatter={(value) => `#${value}`}
+              />
+              <YAxis stroke="#ffffff" style={{ fontSize: '13px' }} />
+              <Tooltip
+                contentStyle={{
+                  background: '#0a0a0a',
+                  border: '1px solid #ec4899',
+                  borderRadius: '8px',
+                  color: '#ffffff',
+                }}
+                itemStyle={{ color: '#ffffff' }}
+                labelStyle={{ color: '#ffffff' }}
+              />
+              <Line type="monotone" dataKey="total_reward" stroke="#ec4899" strokeWidth={2} dot={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
 
       {stats?.recent_predictions && stats.recent_predictions.length > 0 && (
         <div className="card">

@@ -1,10 +1,10 @@
 import React, { useState } from 'react';
-import axios from 'axios';
 import { RiSearchLine } from 'react-icons/ri';
 import './SentimentAnalyzer.css';
 import WordHighlight from './WordHighlight';
 import ImageHeatmap from './ImageHeatmap';
 import SentimentGauge from './SentimentGauge';
+import apiClient from '../apiClient';
 
 function SentimentAnalyzer() {
   const [text, setText] = useState('');
@@ -13,6 +13,8 @@ function SentimentAnalyzer() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [feedbackStatus, setFeedbackStatus] = useState(null);
+  const [feedbackLoading, setFeedbackLoading] = useState(false);
 
   const handleImageChange = (e) => {
     const file = e.target.files[0];
@@ -44,6 +46,8 @@ function SentimentAnalyzer() {
       return;
     }
 
+    setFeedbackStatus(null);
+    setFeedbackLoading(false);
     setLoading(true);
     setError(null);
     setResult(null);
@@ -54,7 +58,7 @@ function SentimentAnalyzer() {
         imageBase64 = await convertImageToBase64(image);
       }
 
-      const response = await axios.post('/api/analyze', {
+      const response = await apiClient.post('/api/analyze', {
         text: text || null,
         image_base64: imageBase64
       });
@@ -64,6 +68,27 @@ function SentimentAnalyzer() {
       setError(err.response?.data?.error || 'An error occurred');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleFeedback = async (isCorrect) => {
+    if (!result?.metadata?.rl_state) {
+      return;
+    }
+    setFeedbackLoading(true);
+    setFeedbackStatus('Learning from feedback…');
+    try {
+      await apiClient.post('/api/feedback', {
+        state: result.metadata.rl_state,
+        action: result.metadata.rl_action,
+        correct: isCorrect
+      });
+      setFeedbackStatus('Thanks! The model is learning.');
+    } catch (err) {
+      setFeedbackStatus('Failed to send feedback');
+    } finally {
+      setFeedbackLoading(false);
+      setTimeout(() => setFeedbackStatus(null), 2500);
     }
   };
 
@@ -168,6 +193,26 @@ function SentimentAnalyzer() {
                 )}
               </div>
             )}
+
+            <div className="feedback-row">
+              <button
+                className="feedback-button positive"
+                onClick={() => handleFeedback(true)}
+                disabled={feedbackLoading || !result?.metadata?.rl_state}
+              >
+                👍 Correct
+              </button>
+              <button
+                className="feedback-button negative"
+                onClick={() => handleFeedback(false)}
+                disabled={feedbackLoading || !result?.metadata?.rl_state}
+              >
+                👎 Wrong
+              </button>
+              {feedbackStatus && (
+                <span className="feedback-message">{feedbackStatus}</span>
+              )}
+            </div>
           </div>
         )}
       </div>

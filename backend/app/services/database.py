@@ -54,6 +54,16 @@ class Database:
                 avg_confidence REAL DEFAULT 0
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                state TEXT,
+                action INTEGER,
+                reward REAL
+            )
+        ''')
         
         conn.commit()
         conn.close()
@@ -90,6 +100,28 @@ class Database:
         conn.close()
         
         return prediction_id
+
+    def save_feedback(self, feedback_data: Dict) -> int:
+        """Store user feedback for RL loop."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            '''
+            INSERT INTO feedback (state, action, reward)
+            VALUES (?, ?, ?)
+            ''',
+            (
+                json.dumps(feedback_data.get('state', [])),
+                feedback_data.get('action', 0),
+                feedback_data.get('reward', 0.0),
+            ),
+        )
+
+        feedback_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return feedback_id
     
     def _update_analytics(self, cursor, prediction_data: Dict):
         """Update daily analytics."""
@@ -193,6 +225,25 @@ class Database:
             GROUP BY modality
         ''')
         modality_dist = {row[0]: row[1] for row in cursor.fetchall()}
+
+        feedback_limit = max(days * 10, 50)
+        cursor.execute('''
+            SELECT timestamp, reward
+            FROM feedback
+            ORDER BY timestamp ASC
+            LIMIT ?
+        ''', (feedback_limit,))
+        feedback_curve = []
+        cumulative_reward = 0.0
+        for episode, row in enumerate(cursor.fetchall(), start=1):
+            reward = row[1] or 0.0
+            cumulative_reward += reward
+            feedback_curve.append({
+                'episode': episode,
+                'reward': reward,
+                'total_reward': cumulative_reward,
+                'timestamp': row[0],
+            })
         
         conn.close()
         
@@ -201,7 +252,8 @@ class Database:
             'sentiment_distribution': sentiment_dist,
             'daily_stats': daily_stats,
             'avg_confidence': avg_confidence,
-            'modality_distribution': modality_dist
+            'modality_distribution': modality_dist,
+            'feedback_curve': feedback_curve
         }
     
     def clear_old_data(self, days: int = 30):

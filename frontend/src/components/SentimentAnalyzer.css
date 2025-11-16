@@ -58,6 +58,49 @@
   font-size: var(--text-base);
 }
 
+.feedback-row {
+  display: flex;
+  gap: var(--space-lg);
+  align-items: center;
+  margin-top: var(--space-2xl);
+  flex-wrap: wrap;
+}
+
+.feedback-button {
+  border: none;
+  border-radius: 999px;
+  padding: 0.6rem 1.5rem;
+  font-weight: 600;
+  cursor: pointer;
+  color: #ffffff;
+  transition: opacity 0.2s ease;
+}
+
+.feedback-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.feedback-button.positive {
+  background: #22c55e;
+}
+
+.feedback-button.negative {
+  background: #ef4444;
+}
+
+.feedback-message {
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0% { opacity: 0.5; }
+  50% { opacity: 1; }
+  100% { opacity: 0.5; }
+}
+
 @media (max-width: 768px) {
   .image-preview {
     max-width: 100%;
