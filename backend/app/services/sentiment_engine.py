@@ -4,8 +4,17 @@ Uses lexicon-based approach with intensity boosters and negation handling
 """
 
 import re
-from typing import Dict, List, Tuple
+import threading
+from typing import Dict, List, Optional
 import numpy as np
+
+try:
+    from transformers import pipeline
+except Exception as exc:  # transformers might be unavailable during cold start
+    pipeline = None
+    _pipeline_import_error = exc
+else:
+    _pipeline_import_error = None
 
 # Sentiment lexicon (word -> score)
 SENTIMENT_LEXICON = {
@@ -63,6 +72,53 @@ NEGATIONS = {
 # Punctuation emphasis
 EXCLAMATION_BOOST = 0.3
 QUESTION_DAMPENER = -0.2
+
+
+def calibrate_sentiment_probabilities(probabilities: Dict[str, float]) -> tuple[str, float]:
+    """Promote neutral when confidence is low or distributions are balanced."""
+    sentiment_label = max(probabilities, key=probabilities.get)
+    confidence = probabilities[sentiment_label]
+    neutral_prob = probabilities.get('neutral', 0.0)
+
+    if sentiment_label != 'neutral':
+        if confidence < 0.55 and neutral_prob >= 0.25:
+            sentiment_label = 'neutral'
+            confidence = neutral_prob
+        elif neutral_prob >= 0.35 and abs(confidence - neutral_prob) <= 0.1:
+            sentiment_label = 'neutral'
+            confidence = neutral_prob
+
+    return sentiment_label, confidence
+
+_TRANSFORMER_PIPELINE = None
+_TRANSFORMER_LOCK = threading.Lock()
+_TRANSFORMER_MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+
+
+def _get_transformer_pipeline():
+    """Load and cache the transformer sentiment pipeline."""
+    global _TRANSFORMER_PIPELINE
+    if pipeline is None:
+        if _pipeline_import_error:
+            print(f"⚠ Transformer import unavailable: {_pipeline_import_error}")
+        return None
+
+    if _TRANSFORMER_PIPELINE is None:
+        with _TRANSFORMER_LOCK:
+            if _TRANSFORMER_PIPELINE is None:
+                try:
+                    _TRANSFORMER_PIPELINE = pipeline(
+                        "text-classification",
+                        model=_TRANSFORMER_MODEL,
+                        tokenizer=_TRANSFORMER_MODEL,
+                        return_all_scores=True,
+                        truncation=True,
+                    )
+                    print(f"✓ Loaded transformer sentiment model: {_TRANSFORMER_MODEL}")
+                except Exception as exc:
+                    print(f"⚠ Failed to load transformer sentiment model ({exc}).")
+                    _TRANSFORMER_PIPELINE = None
+    return _TRANSFORMER_PIPELINE
 
 
 def preprocess_text_for_sentiment(text: str) -> List[str]:
@@ -209,6 +265,109 @@ def analyze_sentiment_lexicon(text: str) -> Dict:
         'attention_weights': attention_weights,
         'tokens': tokens
     }
+
+
+def analyze_sentiment_transformer(text: str) -> Optional[Dict]:
+    """Analyze sentiment using a transformer model when available."""
+    if not text or len(text.strip()) == 0:
+        return None
+
+    pipeline_instance = _get_transformer_pipeline()
+    if not pipeline_instance:
+        return None
+
+    try:
+        outputs = pipeline_instance(text, truncation=True)
+    except Exception as exc:
+        print(f"⚠ Transformer inference failed: {exc}")
+        return None
+
+    if not outputs:
+        return None
+
+    scores = outputs[0]
+    label_map = {
+        'label_0': 'negative',
+        'label_1': 'neutral',
+        'label_2': 'positive',
+        'negative': 'negative',
+        'neutral': 'neutral',
+        'positive': 'positive',
+    }
+
+    probabilities = {label: 0.0 for label in ['negative', 'neutral', 'positive']}
+    for item in scores:
+        label_key = item['label'].lower()
+        mapped = label_map.get(label_key)
+        if mapped:
+            probabilities[mapped] = float(item['score'])
+
+    total = sum(probabilities.values())
+    if total <= 0:
+        return None
+
+    sentiment_label, confidence = calibrate_sentiment_probabilities(probabilities)
+
+    return {
+        'sentiment': sentiment_label,
+        'confidence': float(confidence),
+        'probabilities': probabilities,
+        'raw_scores': scores,
+    }
+
+
+def analyze_text_sentiment(text: str) -> Dict:
+    """Blend lexicon and transformer sentiment for improved accuracy."""
+    lexicon_result = analyze_sentiment_lexicon(text)
+    transformer_result = analyze_sentiment_transformer(text)
+
+    if not transformer_result:
+        return lexicon_result
+
+    weight_transformer = 0.75
+    weight_lexicon = 0.25
+
+    combined_probs = {}
+    for label in ['negative', 'neutral', 'positive']:
+        transformer_prob = transformer_result['probabilities'].get(label, 0.0)
+        lexicon_prob = lexicon_result['probabilities'].get(label, 0.0)
+        combined_probs[label] = transformer_prob * weight_transformer + lexicon_prob * weight_lexicon
+
+    total = sum(combined_probs.values())
+    if total > 0:
+        combined_probs = {label: value / total for label, value in combined_probs.items()}
+    else:
+        combined_probs = lexicon_result['probabilities']
+
+    sentiment_label, confidence = calibrate_sentiment_probabilities(combined_probs)
+
+    result = {
+        'sentiment': sentiment_label,
+        'confidence': float(confidence),
+        'compound_score': lexicon_result.get('compound_score', 0.0),
+        'probabilities': {label: float(value) for label, value in combined_probs.items()},
+        'tokens': lexicon_result.get('tokens'),
+        'attention_weights': lexicon_result.get('attention_weights'),
+        'source_breakdown': {
+            'transformer': {
+                'sentiment': transformer_result['sentiment'],
+                'confidence': transformer_result['confidence'],
+                'probabilities': transformer_result['probabilities'],
+            },
+            'lexicon': {
+                'sentiment': lexicon_result['sentiment'],
+                'confidence': lexicon_result['confidence'],
+                'probabilities': lexicon_result['probabilities'],
+                'compound_score': lexicon_result.get('compound_score', 0.0),
+            },
+            'weights': {
+                'transformer': weight_transformer,
+                'lexicon': weight_lexicon,
+            }
+        }
+    }
+
+    return result
 
 
 def test_sentiment_analyzer():

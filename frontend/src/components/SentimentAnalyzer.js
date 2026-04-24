@@ -28,6 +28,15 @@ function SentimentAnalyzer() {
     }
   };
 
+  const handleRemoveImage = () => {
+    setImage(null);
+    setImagePreview(null);
+    const fileInput = document.getElementById('image-input');
+    if (fileInput) {
+      fileInput.value = '';
+    }
+  };
+
   const convertImageToBase64 = (file) => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -122,6 +131,14 @@ function SentimentAnalyzer() {
           {imagePreview && (
             <div className="image-preview">
               <img src={imagePreview} alt="Preview" />
+              <button
+                type="button"
+                className="button outline"
+                onClick={handleRemoveImage}
+                style={{ marginTop: 'var(--space-md)' }}
+              >
+                Remove Image
+              </button>
             </div>
           )}
         </div>

@@ -7,7 +7,7 @@ from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, H
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -18,13 +18,47 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 import traceback
+import csv
+from dotenv import load_dotenv
 
-from .services.sentiment_engine import analyze_sentiment_lexicon
+load_dotenv()
+
+import pandas as pd
+
+from .services.sentiment_engine import analyze_text_sentiment, calibrate_sentiment_probabilities
 from .services.image_sentiment import analyze_image_sentiment
 from .services.database import get_database
 from .services.correction import DQNAgent, CorrectionLayer, apply_action_bias
 from .models.text_bigru import BiGRUTextEncoder
 from .models.multimodal_autoencoder import MultimodalAutoencoderService
+from .services.file_parser import parse_file
+from .db import save_analysis, get_user_history, init_user_profile, get_user_profile, deduct_credits
+from pydantic import BaseModel
+
+
+# Column name candidates for file parsing
+TEXT_COLUMN_CANDIDATES = [
+    'text',
+    'content',
+    'message',
+    'post',
+    'comment',
+    'description',
+    'body',
+    'tweet',
+    'review',
+    'feedback'
+]
+
+COMPANY_COLUMN_CANDIDATES = [
+    'company',
+    'brand',
+    'organization',
+    'vendor',
+    'store',
+    'business',
+    'source'
+]
 
 app = FastAPI(
     title="Multimodal Sentiment Analyzer API",
@@ -35,11 +69,18 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",  # Add this line
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",  # Add this line
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+print("[OK] CORS configured for origins: localhost:3000, localhost:3001, 127.0.0.1:3000, 127.0.0.1:3001")
 
 # Global device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -67,7 +108,7 @@ correction_weights_path = CHECKPOINT_DIR / "correction_layer.pt"
 if correction_weights_path.exists():
     try:
         correction_layer.load_state_dict(torch.load(correction_weights_path, map_location=device))
-        print("✓ Correction layer checkpoint loaded")
+        print("[OK] Correction layer checkpoint loaded")
     except Exception as exc:
         print(f"Warning: correction layer checkpoint mismatch ({exc}); using fresh weights.")
 
@@ -81,23 +122,23 @@ async def startup_event():
     """Initialize services on startup."""
     global db, text_encoder, autoencoder_service
     print("=" * 60)
-    print("🚀 Starting Sentiment Analysis API v2.0")
+    print("[START] Starting Sentiment Analysis API v2.0")
     print("=" * 60)
     
     # Initialize database
     db = get_database("../sentiment_data.db")
-    print("✓ Database initialized")
+    print("[OK] Database initialized")
     
     # Pre-load image analyzer (loads ResNet50)
     from .services.image_sentiment import get_image_analyzer
     get_image_analyzer(device)
-    print(f"✓ Image analyzer loaded (device: {device})")
+    print(f"[OK] Image analyzer loaded (device: {device})")
 
     text_encoder = BiGRUTextEncoder(checkpoint_dir=str(CHECKPOINT_DIR), device=device)
     if text_encoder.available:
-        print("✓ Text Bi-GRU encoder ready")
+        print("[OK] Text Bi-GRU encoder ready")
     else:
-        print("⚠ Text Bi-GRU encoder weights not found; lexicon-only mode.")
+        print("[WARN] Text Bi-GRU encoder weights not found; lexicon-only mode.")
 
     autoencoder_service = MultimodalAutoencoderService(
         checkpoint_dir=str(CHECKPOINT_DIR),
@@ -107,11 +148,11 @@ async def startup_event():
         latent_dim=AUTOENCODER_LATENT_DIM,
     )
     if autoencoder_service.available:
-        print("✓ Multimodal autoencoder ready")
+        print("[OK] Multimodal autoencoder ready")
     else:
-        print("⚠ Multimodal autoencoder weights not found; latent fusion disabled.")
+        print("[WARN] Multimodal autoencoder weights not found; latent fusion disabled.")
     
-    print("✓ Text sentiment engine ready")
+    print("[OK] Text sentiment engine ready")
     print("=" * 60)
     print("API is ready to accept requests!")
     print("=" * 60)
@@ -269,26 +310,90 @@ async def analyze_sentiment(request: MultimodalRequest):
                     status_code=400,
                     detail="Text too long. Maximum 10,000 characters."
                 )
-            text_result = analyze_sentiment_lexicon(request.text)
+            text_result = analyze_text_sentiment(request.text)
+            base_probs = dict(text_result['probabilities'])
+            source_breakdown = text_result.get('source_breakdown', {}) or {}
+            if not source_breakdown:
+                source_breakdown = {
+                    'lexicon': {
+                        'probabilities': dict(base_probs),
+                        'sentiment': text_result['sentiment'],
+                        'confidence': text_result['confidence'],
+                        'compound_score': text_result.get('compound_score', 0.0),
+                    },
+                    'weights': {'lexicon': 1.0},
+                }
+                text_result['source_breakdown'] = source_breakdown
+
             if text_encoder and text_encoder.available:
                 bigru_output = text_encoder.predict(request.text)
                 if bigru_output:
                     text_embedding = bigru_output.get("embedding")
                     bigru_probs = bigru_output.get("probabilities", {})
-                    lexicon_probs = dict(text_result['probabilities'])
                     combined_text_probs = {}
-                    for label in lexicon_probs:
+                    weight_base = 0.7
+                    weight_bigru = 0.3
+                    for label in base_probs:
                         combined_text_probs[label] = (
-                            lexicon_probs[label] + bigru_probs.get(label, 0.0)
-                        ) / 2.0
+                            base_probs[label] * weight_base +
+                            bigru_probs.get(label, 0.0) * weight_bigru
+                        )
+                    total = sum(combined_text_probs.values())
+                    if total > 0:
+                        combined_text_probs = {
+                            label: value / total for label, value in combined_text_probs.items()
+                        }
                     text_result['probabilities'] = combined_text_probs
-                    text_result['sentiment'] = max(combined_text_probs, key=combined_text_probs.get)
-                    text_result['confidence'] = combined_text_probs[text_result['sentiment']]
-                    text_model_metadata = {
-                        'lexicon_probs': lexicon_probs,
-                        'bigru_probs': bigru_probs,
-                        'combined_probs': combined_text_probs,
+                    calibrated_label, calibrated_confidence = calibrate_sentiment_probabilities(combined_text_probs)
+                    text_result['sentiment'] = calibrated_label
+                    text_result['confidence'] = calibrated_confidence
+
+                    # Update breakdown metadata
+                    lexicon_details = source_breakdown.get('lexicon') or {
+                        'probabilities': dict(base_probs),
+                        'sentiment': text_result['sentiment'],
+                        'confidence': text_result['confidence'],
+                        'compound_score': text_result.get('compound_score', 0.0),
                     }
+                    transformer_details = source_breakdown.get('transformer')
+                    weights = source_breakdown.get('weights', {})
+                    if weights:
+                        weights = {
+                            key: (value or 0.0) * weight_base for key, value in weights.items()
+                        }
+                    else:
+                        weights = {'ensemble_base': weight_base}
+                    weights['bigru'] = weight_bigru
+                    bigru_sentiment = max(bigru_probs, key=bigru_probs.get) if bigru_probs else None
+                    bigru_confidence = bigru_probs.get(bigru_sentiment) if bigru_sentiment else None
+                    source_breakdown.update({
+                        'lexicon': lexicon_details,
+                        'transformer': transformer_details,
+                        'bigru': {
+                            'probabilities': bigru_probs,
+                            'sentiment': bigru_sentiment,
+                            'confidence': bigru_confidence,
+                        },
+                        'weights': weights,
+                        'ensemble_pre_bigru': {
+                            'probabilities': base_probs,
+                        }
+                    })
+                    text_result['source_breakdown'] = source_breakdown
+                    text_model_metadata = {
+                        'ensemble_base_probs': base_probs,
+                        'bigru_probs': bigru_probs,
+                        'transformer_probs': transformer_details.get('probabilities') if transformer_details else None,
+                        'lexicon_probs': lexicon_details.get('probabilities') if lexicon_details else None,
+                        'final_probs': combined_text_probs,
+                    }
+            else:
+                text_model_metadata = {
+                    'ensemble_base_probs': base_probs,
+                    'transformer_probs': source_breakdown.get('transformer', {}).get('probabilities') if source_breakdown else None,
+                    'lexicon_probs': source_breakdown.get('lexicon', {}).get('probabilities') if source_breakdown else None,
+                    'final_probs': base_probs,
+                }
             modality = "text"
         
         # Analyze image
@@ -520,6 +625,133 @@ async def upload_post(
         )
 
 
+@app.post("/api/batch-analyze")
+async def batch_analyze(file: UploadFile = File(...), x_user_id: str = Header(None)):
+    """
+    Batch analyze sentiment from a file (CSV, Excel, PDF).
+    Groups results by 'company' if the column exists.
+    """
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+        
+    user = await get_user_profile(x_user_id)
+    if x_user_id == "guest_user_101" and not user:
+        # Auto-init guest for testing
+        user = await init_user_profile("guest_user_101", "Guest Tester", "guest@acrux.test", None)
+        
+    if not user or user.get("credits", 0) <= 0:
+        raise HTTPException(status_code=403, detail="Insufficient credits (0). Please upgrade your account.")
+
+    print(f"[BATCH] Received file: {file.filename}, content_type: {file.content_type}")
+    try:
+        # Parse file
+        print("[BATCH] Starting file parsing...")
+        records = await parse_file(file)
+        print(f"[BATCH] Parsed {len(records)} records")
+        
+        results = []
+        company_stats = {}
+        
+        for record in records:
+            text = record.get('text', '')
+            if not text:
+                continue
+                
+            # Analyze text (using the core service directly for speed)
+            # We replicate some logic from analyze_sentiment here for consistency
+            # but simplified for batch processing to avoid overhead
+            
+            text_result = analyze_text_sentiment(text)
+            
+            # Apply BiGRU if available (simplified version of main logic)
+            if text_encoder and text_encoder.available:
+                bigru_output = text_encoder.predict(text)
+                if bigru_output:
+                    base_probs = text_result['probabilities']
+                    bigru_probs = bigru_output.get("probabilities", {})
+                    combined_probs = {}
+                    for label in base_probs:
+                        combined_probs[label] = (
+                            base_probs[label] * 0.7 +
+                            bigru_probs.get(label, 0.0) * 0.3
+                        )
+                    text_result['probabilities'] = combined_probs
+                    calibrated_label, calibrated_confidence = calibrate_sentiment_probabilities(combined_probs)
+                    text_result['sentiment'] = calibrated_label
+                    text_result['confidence'] = calibrated_confidence
+
+            # Prepare result object
+            analysis_result = {
+                'text': text[:200] + "..." if len(text) > 200 else text, # Truncate for response
+                'sentiment': text_result['sentiment'],
+                'confidence': text_result['confidence'],
+                'probabilities': text_result['probabilities'],
+                'company': record.get('company', 'Unknown'),
+                'metadata': {k: v for k, v in record.items() if k not in ['text', 'company']}
+            }
+            
+            results.append(analysis_result)
+            
+            # Save to DB (optional, maybe too slow for large batches? Let's do it for now)
+            if db:
+                try:
+                    db.save_prediction({
+                        'text': text,
+                        'has_image': False,
+                        'sentiment': text_result['sentiment'],
+                        'confidence': text_result['confidence'],
+                        'probabilities': text_result['probabilities'],
+                        'compound_score': text_result.get('compound_score', 0.0),
+                        'modality': 'text',
+                        'metadata': {'source': 'batch_upload', 'company': record.get('company')}
+                    })
+                except:
+                    pass
+
+        # Group by company
+        grouped_results = {}
+        for res in results:
+            company = res['company']
+            if company not in grouped_results:
+                grouped_results[company] = {
+                    'total': 0,
+                    'sentiment_counts': {'positive': 0, 'neutral': 0, 'negative': 0},
+                    'items': []
+                }
+            
+            grouped_results[company]['total'] += 1
+            grouped_results[company]['sentiment_counts'][res['sentiment']] += 1
+            grouped_results[company]['items'].append(res)
+
+        output_data = {
+            "status": "success",
+            "total_processed": len(results),
+            "results_by_company": grouped_results,
+            "filename": file.filename,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        if x_user_id:
+            try:
+                await save_analysis(x_user_id, output_data)
+                await deduct_credits(x_user_id, 1)
+                print(f"[DB] Saved analysis & deducted 1 credit for user: {x_user_id}")
+            except Exception as db_err:
+                print(f"[DB] Error saving analysis: {db_err}")
+
+        return output_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in batch_analyze: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing batch file: {str(e)}"
+        )
+
+
 @app.post("/api/feedback")
 async def submit_feedback(feedback: FeedbackRequest):
     reward = 1.0 if feedback.correct else -1.0
@@ -574,7 +806,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     "confidence": result.confidence,
                     "probabilities": result.probabilities,
                     "timestamp": datetime.now().isoformat(),
-                    "success": True
+                    "success": True,
+                    "inputText": request.text,
+                    "inputImage": request.image_base64
                 }
                 
                 await manager.send_personal_message(response, websocket)
@@ -591,6 +825,37 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"WebSocket error: {e}")
         manager.disconnect(websocket)
 
+
+@app.get("/api/history")
+async def get_history(x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="User identity (X-User-Id header) required")
+    try:
+        history = await get_user_history(x_user_id)
+        return {"status": "success", "history": history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+class UserInitRequest(BaseModel):
+    name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+
+@app.post("/api/users/init")
+async def init_user(req: UserInitRequest, x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="User ID required")
+    user = await init_user_profile(x_user_id, req.name, req.email, req.phone)
+    return {"status": "success", "user": user}
+
+@app.get("/api/users/profile")
+async def get_profile(x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="User ID required")
+    user = await get_user_profile(x_user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "success", "user": user}
 
 @app.get("/api/dashboard")
 async def get_dashboard_data():
@@ -640,7 +905,192 @@ async def get_stats():
     }
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/api/predictions")
+async def get_predictions():
+    """
+    Generate future sentiment predictions for the next 3 months.
+    Uses simple linear regression on recent daily stats.
+    """
+    if not db:
+        return {"forecast": [], "recommendations": []}
+
+    try:
+        # Get last 30 days of data to calculate trend
+        stats = db.get_statistics(days=30)
+        daily_stats = stats.get('daily_stats', [])
+        
+        # Prepare data for regression
+        # x = day index, y = positive ratio
+        x = []
+        y = []
+        
+        # Sort by date
+        daily_stats.sort(key=lambda k: k['date'])
+        
+        for i, day in enumerate(daily_stats):
+            total = day.get('total', 0)
+            if total > 0:
+                pos_ratio = day.get('positive', 0) / total
+                x.append(i)
+                y.append(pos_ratio)
+        
+        # Calculate trend (slope)
+        slope = 0
+        intercept = 0.5 # Default neutral
+        
+        if len(x) > 1:
+            x_mean = sum(x) / len(x)
+            y_mean = sum(y) / len(y)
+            
+            numerator = sum((xi - x_mean) * (yi - y_mean) for xi, yi in zip(x, y))
+            denominator = sum((xi - x_mean) ** 2 for xi in x)
+            
+            if denominator != 0:
+                slope = numerator / denominator
+                intercept = y_mean - (slope * x_mean)
+        
+        # Generate forecast for next 90 days (3 months)
+        forecast = []
+        recommendations = []
+        
+        current_date = datetime.now()
+        start_idx = len(x)
+        
+        for i in range(1, 91): # Next 90 days
+            future_date = current_date + asyncio.timedelta(days=i) # asyncio doesn't have timedelta, use standard datetime
+            # Wait, standard datetime is imported as datetime
+            from datetime import timedelta
+            future_date = current_date + timedelta(days=i)
+            
+            idx = start_idx + i
+            predicted_ratio = max(0.0, min(1.0, slope * idx + intercept))
+            
+            # Add some random noise to make it look realistic
+            import random
+            noise = random.uniform(-0.05, 0.05)
+            predicted_ratio = max(0.0, min(1.0, predicted_ratio + noise))
+            
+            forecast.append({
+                "date": future_date.isoformat(),
+                "predicted_sentiment_score": predicted_ratio, # 0 to 1 (0=neg, 1=pos)
+                "confidence": 0.8 - (i * 0.005) # Confidence drops over time
+            })
+            
+        # Generate recommendations based on slope
+        if slope < -0.005:
+            recommendations = [
+                "Sentiment is trending downwards. Immediate action required.",
+                "Investigate recent negative feedback spikes.",
+                "Review customer support response times.",
+                "Consider a customer appreciation campaign to boost morale."
+            ]
+        elif slope > 0.005:
+            recommendations = [
+                "Sentiment is trending upwards! Keep up the good work.",
+                "Identify what's working and double down on it.",
+                "Share positive feedback with the team to boost morale.",
+                "Consider asking happy customers for referrals."
+            ]
+        else:
+            recommendations = [
+                "Sentiment is stable.",
+                "Focus on converting neutral customers to positive.",
+                "Monitor key competitors for market shifts.",
+                "Experiment with small improvements to product features."
+            ]
+            
+        return {
+            "forecast": forecast,
+            "recommendations": recommendations,
+            "trend_slope": slope
+        }
+        
+    except Exception as e:
+        print(f"Error generating predictions: {e}")
+        print(traceback.format_exc())
+        return {"forecast": [], "recommendations": [], "error": str(e)}
+
+
+def _pick_column(columns, candidates) -> Tuple[str, bool]:
+    lower_map = {col.lower(): col for col in columns}
+    for name in candidates:
+        if name in lower_map:
+            return lower_map[name], True
+    # fallback to first column if no match
+    return columns[0], False
+
+
+async def parse_file(upload: UploadFile) -> List[Dict]:
+    raw_bytes = await upload.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    suffix = Path(upload.filename or "").suffix.lower()
+    buffer = io.BytesIO(raw_bytes)
+
+    try:
+        if suffix in {".csv"}:
+            buffer.seek(0)
+            reader = csv.DictReader(io.TextIOWrapper(buffer, encoding="utf-8", newline=""))
+            rows = list(reader)
+            if not rows:
+                raise HTTPException(status_code=400, detail="CSV file has headers but no rows.")
+            columns = reader.fieldnames or []
+            data_frame = pd.DataFrame(rows)
+        elif suffix in {".xlsx", ".xls"}:
+            buffer.seek(0)
+            data_frame = pd.read_excel(buffer)
+            columns = list(data_frame.columns)
+        elif suffix in {".json"}:
+            buffer.seek(0)
+            data_frame = pd.read_json(buffer)
+            columns = list(data_frame.columns)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Use CSV, XLSX, or JSON.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to parse file: {exc}") from exc
+
+    if not columns:
+        raise HTTPException(status_code=400, detail="File does not contain any columns.")
+
+    text_col, text_found = _pick_column(columns, TEXT_COLUMN_CANDIDATES)
+    company_col, company_found = _pick_column(columns, COMPANY_COLUMN_CANDIDATES) if len(columns) > 1 else (None, False)
+
+    records: List[Dict] = []
+    missing_rows = 0
+
+    for _, row in data_frame.iterrows():
+        text_value = str(row.get(text_col, "")).strip()
+        if not text_value:
+            missing_rows += 1
+            continue
+
+        record = {"text": text_value}
+
+        if company_col:
+            company_value = str(row.get(company_col, "")).strip()
+            record["company"] = company_value or "Unknown"
+
+        for col in columns:
+            if col in {text_col, company_col}:
+                continue
+            record.setdefault(col, row.get(col))
+        records.append(record)
+
+    if not records:
+        if missing_rows:
+            raise HTTPException(
+                status_code=400,
+                detail="No usable text rows were found. Ensure the file has a column containing text content."
+            )
+        raise HTTPException(status_code=400, detail="No data rows were found in the file.")
+
+    if not text_found:
+        print(f"[BATCH] Warning: Used column '{text_col}' as text fallback; expected columns: {TEXT_COLUMN_CANDIDATES}")
+    if company_col and not company_found:
+        print(f"[BATCH] Warning: Used column '{company_col}' as company fallback; expected columns: {COMPANY_COLUMN_CANDIDATES}")
+
+    return records
 

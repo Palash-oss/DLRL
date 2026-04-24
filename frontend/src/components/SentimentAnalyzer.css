@@ -67,26 +67,52 @@
 }
 
 .feedback-button {
-  border: none;
-  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: var(--radius-md);
   padding: 0.6rem 1.5rem;
   font-weight: 600;
   cursor: pointer;
+  color: #e2e8f0;
+  background: rgba(30, 41, 59, 0.6);
+  backdrop-filter: blur(10px);
+  transition: all 0.3s ease;
+  text-transform: uppercase;
+  font-size: var(--text-xs);
+  letter-spacing: 0.05em;
+}
+
+.feedback-button:hover {
+  background: #f97316;
+  border-color: #f97316;
   color: #ffffff;
-  transition: opacity 0.2s ease;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 15px rgba(249, 115, 22, 0.3);
 }
 
 .feedback-button:disabled {
-  opacity: 0.5;
+  opacity: 0.3;
   cursor: not-allowed;
+  transform: none;
 }
 
 .feedback-button.positive {
-  background: #22c55e;
+  /* Inherit default dark glassy */
+}
+
+.feedback-button.positive:hover {
+  background: #10b981; /* Green for positive */
+  border-color: #10b981;
+  box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
 }
 
 .feedback-button.negative {
-  background: #ef4444;
+  /* Inherit default dark glassy */
+}
+
+.feedback-button.negative:hover {
+  background: #ef4444; /* Red for negative */
+  border-color: #ef4444;
+  box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);
 }
 
 .feedback-message {

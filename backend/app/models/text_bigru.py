@@ -127,3 +127,39 @@ class BiGRUTextEncoder:
             "embedding": features.squeeze(0).cpu().tolist(),
             "logits": logits.squeeze(0).cpu().tolist(),
         }
+
+
+def _demo() -> None:
+    """Simple CLI demo for quick status checks."""
+    project_root = Path(__file__).resolve().parents[3]
+    checkpoint_dir = project_root / "checkpoints"
+    print(f"Using checkpoint directory: {checkpoint_dir}")
+
+    encoder = BiGRUTextEncoder(str(checkpoint_dir))
+    if not encoder.available:
+        print("Bi-GRU encoder unavailable (checkpoint or vocab missing).")
+        return
+
+    samples = [
+        "I feel great about today!",
+        "I'm not sure how I feel right now.",
+        "This is absolutely terrible.",
+    ]
+
+    for text in samples:
+        result = encoder.predict(text)
+        if not result:
+            print(f"No prediction generated for: {text}")
+            continue
+        sentiment = max(result["probabilities"], key=result["probabilities"].get)
+        confidence = result["probabilities"][sentiment]
+        print(f"Text: {text}")
+        print(f"  Sentiment: {sentiment} ({confidence:.3f})")
+        print(
+            "  Probabilities:",
+            {label: round(prob, 3) for label, prob in result["probabilities"].items()},
+        )
+
+
+if __name__ == "__main__":
+    _demo()

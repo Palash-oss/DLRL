@@ -8,8 +8,16 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 import cv2
-from typing import Dict, Tuple
+from typing import Dict, Optional
 from torchvision import models, transforms
+
+try:
+    from transformers import pipeline
+except Exception as exc:
+    pipeline = None
+    _pipeline_import_error = exc
+else:
+    _pipeline_import_error = None
 
 
 class ImageSentimentAnalyzer:
@@ -28,6 +36,44 @@ class ImageSentimentAnalyzer:
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+        self._clip_pipeline = None
+        self._clip_available = False
+        self._clip_candidates = [
+            "positive emotional tone",
+            "neutral emotional tone",
+            "negative emotional tone",
+        ]
+        self._clip_label_map = {
+            "positive emotional tone": "positive",
+            "neutral emotional tone": "neutral",
+            "negative emotional tone": "negative",
+        }
+        self._fer_pipeline = None
+        self._fer_available = False
+        self._fer_model_id = "nateraw/vit-base-patch16-224-in21k-finetuned-fer2013"
+        if pipeline is None:
+            if _pipeline_import_error:
+                print(f"[WARN] Transformer import unavailable for image sentiment: {_pipeline_import_error}")
+        else:
+            try:
+                self._clip_pipeline = pipeline(
+                    "zero-shot-image-classification",
+                    model="openai/clip-vit-base-patch32",
+                )
+                self._clip_available = True
+                print("[OK] Loaded CLIP image sentiment model")
+            except Exception as exc:
+                print(f"[WARN] Failed to load CLIP image sentiment model ({exc}).")
+            try:
+                self._fer_pipeline = pipeline(
+                    "image-classification",
+                    model=self._fer_model_id,
+                    top_k=7,
+                )
+                self._fer_available = True
+                print(f"[OK] Loaded facial emotion model: {self._fer_model_id}")
+            except Exception as exc:
+                print(f"[WARN] Failed to load facial emotion model ({exc}).")
     
     def analyze_colors(self, image: Image.Image) -> Dict:
         """Analyze color distribution and psychology."""
@@ -85,6 +131,83 @@ class ImageSentimentAnalyzer:
             'coolness': float(coolness),
             'color_score': float(np.clip(color_score, -1, 1))
         }
+
+    def _analyze_with_clip(self, image: Image.Image) -> Optional[Dict]:
+        """Run zero-shot classification to estimate sentiment."""
+        if not self._clip_available or self._clip_pipeline is None:
+            return None
+        try:
+            outputs = self._clip_pipeline(
+                image,
+                candidate_labels=self._clip_candidates,
+                hypothesis_template="This image conveys {}.",
+            )
+        except Exception as exc:
+            print(f"[WARN] CLIP image sentiment inference failed: {exc}")
+            return None
+
+        clip_probs = {label: 0.0 for label in ['positive', 'neutral', 'negative']}
+        for item in outputs:
+            mapped = self._clip_label_map.get(item['label'])
+            if mapped:
+                clip_probs[mapped] = float(item['score'])
+
+        total = sum(clip_probs.values())
+        if total <= 0:
+            return None
+
+        sentiment_label = max(clip_probs, key=clip_probs.get)
+        confidence = clip_probs[sentiment_label]
+
+        return {
+            'probabilities': clip_probs,
+            'sentiment': sentiment_label,
+            'confidence': float(confidence),
+            'raw_scores': outputs,
+        }
+
+    def _analyze_with_fer(self, image: Image.Image) -> Optional[Dict]:
+        """Use a facial emotion recognition model to infer sentiment."""
+        if not self._fer_available or self._fer_pipeline is None:
+            return None
+        try:
+            outputs = self._fer_pipeline(image)
+        except Exception as exc:
+            print(f"[WARN] Facial emotion inference failed: {exc}")
+            return None
+
+        sentiment_map = {
+            'angry': 'negative',
+            'disgust': 'negative',
+            'fear': 'negative',
+            'sad': 'negative',
+            'happy': 'positive',
+            'surprise': 'positive',
+            'neutral': 'neutral',
+        }
+
+        sentiment_probs = {label: 0.0 for label in ['negative', 'neutral', 'positive']}
+        for item in outputs:
+            label = item['label'].lower()
+            score = float(item['score'])
+            mapped = sentiment_map.get(label)
+            if mapped:
+                sentiment_probs[mapped] += score
+
+        total = sum(sentiment_probs.values())
+        if total <= 0:
+            return None
+
+        sentiment_probs = {label: value / total for label, value in sentiment_probs.items()}
+        sentiment_label = max(sentiment_probs, key=sentiment_probs.get)
+        confidence = sentiment_probs[sentiment_label]
+
+        return {
+            'probabilities': sentiment_probs,
+            'sentiment': sentiment_label,
+            'confidence': float(confidence),
+            'raw_scores': outputs,
+        }
     
     def extract_deep_features(self, image_tensor: torch.Tensor) -> torch.Tensor:
         """Extract deep features using ResNet50."""
@@ -124,7 +247,7 @@ class ImageSentimentAnalyzer:
         combined_score = color_score + brightness_factor + complexity_score
         combined_score = np.clip(combined_score, -1.5, 1.5)
         
-        # Convert to probabilities
+        # Convert to probabilities using heuristic model
         if combined_score <= -0.3:
             sentiment_label = 'negative'
             neg_prob = 0.5 + min(abs(combined_score) * 0.25, 0.45)
@@ -145,19 +268,65 @@ class ImageSentimentAnalyzer:
             else:
                 neg_prob = remaining * 0.65
                 pos_prob = remaining * 0.35
-        
+
         confidence = max(neg_prob, neu_prob, pos_prob)
-        
-        return {
+        heuristic_result = {
             'sentiment': sentiment_label,
             'confidence': float(confidence),
             'probabilities': {
                 'negative': float(neg_prob),
                 'neutral': float(neu_prob),
-                'positive': float(pos_prob)
+                'positive': float(pos_prob),
             },
             'color_analysis': color_analysis,
-            'combined_score': float(combined_score)
+            'combined_score': float(combined_score),
+        }
+
+        clip_result = self._analyze_with_clip(image)
+        fer_result = self._analyze_with_fer(image)
+
+        sources = [('heuristic', heuristic_result, 0.2)]
+
+        if clip_result:
+            sources.append(('clip', clip_result, 0.3))
+
+        if fer_result:
+            sources.append(('facial_emotion', fer_result, 0.5))
+
+        if len(sources) == 1:
+            return heuristic_result
+
+        total_weight = sum(weight for _, _, weight in sources)
+        combined_probs = {label: 0.0 for label in ['negative', 'neutral', 'positive']}
+        combined_score = 0.0
+        normalized_weights = {}
+
+        for name, source, weight in sources:
+            norm_weight = weight / total_weight if total_weight else 0.0
+            normalized_weights[name] = norm_weight
+            for label in combined_probs:
+                combined_probs[label] += source['probabilities'].get(label, 0.0) * norm_weight
+            score_delta = (
+                source['probabilities'].get('positive', 0.0) -
+                source['probabilities'].get('negative', 0.0)
+            )
+            combined_score += score_delta * norm_weight
+
+        final_sentiment = max(combined_probs, key=combined_probs.get)
+        final_confidence = combined_probs[final_sentiment]
+
+        return {
+            'sentiment': final_sentiment,
+            'confidence': float(final_confidence),
+            'probabilities': {label: float(value) for label, value in combined_probs.items()},
+            'color_analysis': color_analysis,
+            'combined_score': float(combined_score),
+            'source_breakdown': {
+                'clip': clip_result,
+                'facial_emotion': fer_result,
+                'heuristic': heuristic_result,
+                'weights': normalized_weights,
+            }
         }
 
 

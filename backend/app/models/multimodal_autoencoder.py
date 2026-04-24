@@ -98,3 +98,29 @@ class MultimodalAutoencoderService:
         with torch.no_grad():
             latent = self.model.encode(text_tensor, image_tensor)
         return latent.squeeze(0).cpu().tolist()
+
+
+def _demo() -> None:
+    """Small CLI demo so running this module prints something useful."""
+    project_root = Path(__file__).resolve().parents[3]
+    checkpoint_dir = project_root / "checkpoints"
+    print(f"Using checkpoint directory: {checkpoint_dir}")
+    service = MultimodalAutoencoderService(str(checkpoint_dir))
+
+    if not service.available:
+        print("Autoencoder unavailable (checkpoint missing or failed to load).")
+        return
+
+    sample_text = [0.1] * service.text_dim
+    sample_image = [0.2] * service.image_dim
+    latent = service.get_latent(sample_text, sample_image)
+    if latent is None:
+        print("Failed to obtain latent vector.")
+        return
+
+    print(f"Latent dimension: {len(latent)}")
+    print("Latent preview:", [round(value, 4) for value in latent[:8]])
+
+
+if __name__ == "__main__":
+    _demo()
